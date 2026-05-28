@@ -1,0 +1,39 @@
+spring:
+  application:
+    name: govproc
+
+  datasource:
+    url: jdbc:postgresql://localhost:5432/govproc
+    username: govproc
+    password: govproc
+
+  jpa:
+    hibernate:
+      # Flyway controla o schema. JPA apenas valida o mapeamento.
+      ddl-auto: validate
+    open-in-view: false
+    properties:
+      hibernate:
+        format_sql: true
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: true
+
+server:
+  port: 8080
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+
+logging:
+  level:
+    com.govproc: DEBUG
+
+govproc:
+  jwt:
+    # ALTERAR EM PRODUCAO: gerar com 256+ bits de entropia (minimo 64 caracteres hex)
+    secret: 8e9f2a1b4c7d3e6f0a5b8c2d9e4f1a7b3c6d0e5f2a8b1c4d7e0f3a6b9c2d5e8
+    expiration: 86400000  # 24 horas em ms
