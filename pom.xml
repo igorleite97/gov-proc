@@ -19,6 +19,12 @@
 
     <properties>
         <java.version>21</java.version>
+        <!--
+          Override do Testcontainers gerido pelo Spring Boot 3.3.5 (1.19.8 → docker-java 3.3.6).
+          O docker-java 3.3.6 não negocia a API do Docker Engine 29.x (API 1.54) e falha com
+          HTTP 400. A 1.20.x embute docker-java 3.4.x, que negocia a versão da API corretamente.
+        -->
+        <testcontainers.version>1.21.4</testcontainers.version>
     </properties>
 
     <dependencies>
@@ -139,6 +145,32 @@
                         </exclude>
                     </excludes>
                 </configuration>
+            </plugin>
+
+            <!--
+              Cobertura de testes (versão gerida pelo Spring Boot).
+              prepare-agent instrumenta a JVM de teste; report gera HTML/CSV/XML
+              em target/site/jacoco após a fase test. Sem gate de falha por ora.
+            -->
+            <plugin>
+                <groupId>org.jacoco</groupId>
+                <artifactId>jacoco-maven-plugin</artifactId>
+                <version>0.8.12</version>
+                <executions>
+                    <execution>
+                        <id>jacoco-prepare-agent</id>
+                        <goals>
+                            <goal>prepare-agent</goal>
+                        </goals>
+                    </execution>
+                    <execution>
+                        <id>jacoco-report</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>report</goal>
+                        </goals>
+                    </execution>
+                </executions>
             </plugin>
         </plugins>
     </build>

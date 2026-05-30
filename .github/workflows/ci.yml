@@ -1,0 +1,33 @@
+name: CI
+
+# Build + testes a cada push e pull request na main.
+# Roda a suíte completa: 57 testes unitários + 3 de integração (Testcontainers).
+# O runner ubuntu-latest já vem com Docker, então o PostgreSQL dos testes de
+# integração sobe sem configuração adicional.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Build and run tests (unit + Testcontainers integration)
+        run: |
+          chmod +x mvnw
+          ./mvnw -B clean test
