@@ -18,6 +18,8 @@ public interface QuotationRepository extends JpaRepository<Quotation, UUID> {
 
     boolean existsByProcessIdAndSelectedTrue(UUID processId);
 
+    Optional<Quotation> findByProcessIdAndSelectedTrue(UUID processId);
+
     /**
      * Desseleciona todas as cotacoes do processo em um unico UPDATE atomico.
      * Chamado antes de selecionar uma nova cotacao para garantir

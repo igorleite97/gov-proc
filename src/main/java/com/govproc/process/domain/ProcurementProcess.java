@@ -145,9 +145,15 @@ public class ProcurementProcess extends BaseEntity {
         this.status = ProcessStatus.LOSER;
     }
 
-    public void activateContract() {
+    public void startPostBid() {
         requireStatus(ProcessStatus.WINNER,
-                "Processo deve estar WINNER para ativar contrato");
+                "Processo deve estar WINNER para iniciar a fase pós-disputa");
+        this.status = ProcessStatus.POST_BID;
+    }
+
+    public void activateContract() {
+        requireStatus(ProcessStatus.POST_BID,
+                "Processo deve estar POST_BID (pós-disputa concluída) para ativar contrato");
         this.status = ProcessStatus.CONTRACT_ACTIVE;
     }
 

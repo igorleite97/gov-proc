@@ -32,7 +32,8 @@ O GovProc modela o ciclo de vida completo de um processo licitatório público b
 - Separação rígida entre **custo** (Cotação) e **estratégia** (Disputa)
 - Rastreabilidade dupla: `ProcessTimelineEvent` para eventos operacionais, `AuditLog` para alterações de campo
 - `BigDecimal` com precisão `NUMERIC(19,4)` em todo o sistema — sem `double` para dinheiro
-- Monólito modular com 8 pacotes por bounded context, sem camadas de abstração desnecessárias
+- Monólito modular com 11 pacotes por bounded context, sem camadas de abstração desnecessárias
+- Cada fase complexa tem seu **próprio enum de status** (`AnalysisDecision`, `DisputeStatus`, `PostBidStatus`, `ContractStatus`) — o `ProcessStatus` central permanece enxuto, sem absorver cada sub-estado jurídico
 
 ---
 
@@ -41,10 +42,13 @@ O GovProc modela o ciclo de vida completo de um processo licitatório público b
 ```
 com.govproc
 ├── auth/           Autenticação JWT, papéis (ADMIN, MANAGER, ANALYST, VIEWER)
-├── process/        Entidade central + máquina de 11 estados
+├── process/        Entidade central + máquina de estados + read model do dashboard
 ├── analysis/       Análise de viabilidade operacional (1:1 por processo)
 ├── quotation/      Registros de custo por fornecedor — SEM markup, SEM margem
 ├── supplier/       Cadastro independente de fornecedores
+├── dispute/        Estratégia comercial — margem, preço de venda, estratégia de lance
+├── postbid/        Fase pós-disputa — homologação, adjudicação
+├── contract/       Agregado Contract — ciclo de vida + empenhos, faturas, aditivos
 ├── timeline/       Log imutável de eventos operacionais
 ├── audit/          Log imutável de alterações por campo
 └── shared/         BaseEntity, ApiResponse, exceções, handler global
@@ -91,14 +95,20 @@ CAPTURED
        │             │
     WINNER         LOSER
        │
-  [activateContract()]
+   [startPostBid()]
        │
-  CONTRACT_ACTIVE
+     POST_BID   ← fase pós-disputa (PostBid: PENDING→HOMOLOGATED→ADJUDICATED→COMPLETED)
+       │
+   [activateContract()]  ← exige PostBid COMPLETED
+       │
+  CONTRACT_ACTIVE   ← fase contratual (Contract: ACTIVE→CLOSED/EXPIRED/TERMINATED)
        │
    [close()]
        │
     CLOSED
 ```
+
+> **Repare na contenção deliberada:** homologação e adjudicação *não* são estados do processo — vivem dentro do bounded context `PostBid` (`PostBidStatus`). O processo apenas sabe que está em `POST_BID`. O mesmo vale para o ciclo do contrato (`ContractStatus`). Isso mantém o `ProcessStatus` em 11 valores em vez de deixá-lo crescer sem parar a cada etapa jurídica.
 
 ---
 
@@ -114,7 +124,7 @@ CAPTURED
 | Migrações | Flyway |
 | Validação | Jakarta Bean Validation |
 | Documentação | SpringDoc OpenAPI 3 / Swagger UI |
-| Testes | JUnit 5 + Mockito |
+| Testes | JUnit 5 + Mockito (unitários) · Testcontainers (integração) |
 | Build | Maven |
 | Container | Docker + Docker Compose |
 
@@ -145,6 +155,10 @@ Todos os valores monetários usam `BigDecimal` com precisão `NUMERIC(19,4)`. `d
 
 `Supplier` tem ciclo de vida próprio. `Quotation.supplierId` é armazenado como `UUID` puro — sem `@ManyToOne`, sem cascade. Um fornecedor não deve morrer porque uma cotação foi removida.
 
+### 5. Empenho consome saldo — fatura não
+
+No contrato público, são momentos distintos. O **empenho** reserva orçamento e **reduz** o `remainingBalance` — mesmo antes de qualquer pagamento. A **fatura** (liquidação) confirma a entrega; responde *"o fornecedor entregou?"*, não *"quanto ainda posso comprometer?"* — portanto **não** mexe no saldo. O **aditivo** altera a capacidade do contrato (`contractValue` + `remainingBalance` nos tipos de valor; `endDate` nos tipos de prazo). Esses invariantes vivem na raiz do agregado `Contract`.
+
 ---
 
 ## Status dos Módulos
@@ -153,17 +167,21 @@ Todos os valores monetários usam `BigDecimal` com precisão `NUMERIC(19,4)`. `d
 |---|---|---|---|
 | `shared/` | ✅ Completo | — | — |
 | `auth/` | ✅ Completo | V1 | 6 |
-| `process/` | ✅ Completo | V2 | — |
+| `process/` | ✅ Completo | V2 | 5 |
 | `timeline/` | ✅ Completo | V3 | — |
 | `analysis/` | ✅ Completo | V4 | 6 |
 | `audit/` | ✅ Completo | V5 | — |
 | `supplier/` | ✅ Completo | V6 | 2 |
 | `quotation/` | ✅ Completo | V7 | 5 |
-| `dispute/` | 🔲 Pendente | — | — |
-| `postbid/` | 🔲 Pendente | — | — |
-| `contract/` | 🔲 Pendente | — | — |
+| `dispute/` | ✅ Completo | V8 | 9 |
+| `postbid/` | ✅ Completo | V9 | 8 |
+| `contract/` | ✅ Completo | V10, V11 | 16 |
 
-**Totais:** 62 classes · 19 testes · 7 migrações Flyway
+> Os testes em `process/` são do read model do dashboard (CQRS-lite); a máquina de estados central é exercitada pelos testes de workflow de cada módulo.
+
+**Totais:** 118 classes · 60 testes (57 unitários + 3 integração) · 11 migrações Flyway
+
+Os testes de integração (`GovProcIntegrationTest`) sobem o contexto Spring Boot completo contra um PostgreSQL real via **Testcontainers** — provando que as 11 migrations Flyway aplicam, que o mapeamento JPA valida (`ddl-auto=validate`), que a cadeia JWT funciona ponta a ponta e que constraints do banco (ex. `uq_process_number_uasg`) se manifestam corretamente.
 
 ---
 
@@ -244,6 +262,13 @@ Use o token retornado como `Authorization: Bearer <token>` em todas as requisiç
 | `GET` | `/processes/{id}/timeline` | Histórico de eventos operacionais |
 | `GET` | `/processes/{id}/audit` | Log de alterações por campo |
 
+### Dashboard (somente leitura / CQRS-lite)
+| Método | Caminho | Descrição |
+|---|---|---|
+| `GET` | `/dashboard/summary` | Contagens do pipeline + contratos ativos |
+| `GET` | `/dashboard/financial` | Custo cotado, lucro esperado, valor contratado, saldo remanescente |
+| `GET` | `/dashboard/performance` | Taxa de vitória, taxa de derrota, lucro esperado médio |
+
 ### Análise
 | Método | Caminho | Descrição |
 |---|---|---|
@@ -269,6 +294,43 @@ Use o token retornado como `Authorization: Bearer <token>` em todas as requisiç
 | `GET` | `/suppliers/{id}` | Buscar fornecedor por ID |
 | `DELETE` | `/suppliers/{id}` | Desativar fornecedor (exclusão lógica) |
 
+### Disputa
+| Método | Caminho | Descrição |
+|---|---|---|
+| `POST` | `/processes/{id}/dispute/start` | Iniciar disputa → `IN_DISPUTE` (captura custo cotado) |
+| `PUT` | `/processes/{id}/dispute` | Revisar estratégia comercial (auditoria campo a campo) |
+| `POST` | `/processes/{id}/dispute/winner` | Marcar como vencedor → `WINNER` |
+| `POST` | `/processes/{id}/dispute/loser` | Marcar como perdedor → `LOSER` |
+| `GET` | `/processes/{id}/dispute` | Consultar registro da disputa |
+
+### Pós-disputa (PostBid)
+| Método | Caminho | Descrição |
+|---|---|---|
+| `POST` | `/processes/{id}/post-bid/start` | Iniciar fase pós-disputa → `POST_BID` |
+| `POST` | `/processes/{id}/post-bid/homologate` | Homologar → `HOMOLOGATED` |
+| `POST` | `/processes/{id}/post-bid/adjudicate` | Adjudicar → `ADJUDICATED` |
+| `POST` | `/processes/{id}/post-bid/complete` | Concluir → `COMPLETED` |
+| `GET` | `/processes/{id}/post-bid` | Consultar registro pós-disputa |
+
+### Contrato
+| Método | Caminho | Descrição |
+|---|---|---|
+| `POST` | `/processes/{id}/contract/activate` | Ativar contrato → `CONTRACT_ACTIVE` (exige PostBid COMPLETED) |
+| `POST` | `/processes/{id}/contract/close` | Encerrar contrato e processo → `CLOSED` |
+| `POST` | `/processes/{id}/contract/terminate` | Rescindir → contrato `TERMINATED`, processo `CLOSED` |
+| `POST` | `/processes/{id}/contract/expire` | Vencer → contrato `EXPIRED`, processo `CLOSED` |
+| `GET` | `/processes/{id}/contract` | Consultar registro do contrato |
+
+### Execução do Contrato (membros do agregado)
+| Método | Caminho | Descrição |
+|---|---|---|
+| `POST` | `/processes/{id}/contract/commitments` | Registrar empenho — **reduz o saldo** |
+| `GET` | `/processes/{id}/contract/commitments` | Listar empenhos |
+| `POST` | `/processes/{id}/contract/invoices` | Registrar fatura — **não** mexe no saldo |
+| `GET` | `/processes/{id}/contract/invoices` | Listar faturas |
+| `POST` | `/processes/{id}/contract/addenda` | Aplicar aditivo — alteração de valor ou prazo |
+| `GET` | `/processes/{id}/contract/addenda` | Listar aditivos |
+
 ---
 
 ## Decisões Técnicas
@@ -288,16 +350,26 @@ Chamadas de timeline e auditoria são explícitas em cada método de serviço. O
 ### Seleção atômica de cotação
 `selectQuotation()` executa `clearSelectedByProcess(processId)` via `@Modifying @Query` antes de chamar `quotation.select()`. Isso garante exatamente um `selected = true` por processo sem janela de inconsistência.
 
+### Sub-status ficam fora do `ProcessStatus`
+Homologação, adjudicação e o ciclo do contrato *não* são estados do processo. Estão encapsulados em enums próprios (`PostBidStatus`, `ContractStatus`) dentro de seus bounded contexts. A máquina central só conhece `POST_BID` e `CONTRACT_ACTIVE`. É o mesmo raciocínio que mantém o `DisputeStatus` (OPEN/CONCLUDED) fora do processo — e evita que o `ProcessStatus` cresça sem parar.
+
+### O guard de ativação do contrato vive no service
+O método de domínio `activateContract()` só valida `POST_BID → CONTRACT_ACTIVE`. A regra *"somente quando a fase pós-disputa estiver COMPLETED"* vive no `ContractService`, porque o processo não conhece — e não deve conhecer — o `PostBid`. Invariantes entre contextos pertencem à camada de aplicação, não à entidade.
+
 ---
 
 ## Roadmap
 
-- [ ] **Módulo Dispute** — markup, margem, estratégia de lance (esses dados pertencem aqui, não na Cotação)
-- [ ] **Módulo PostBid** — homologação, adjudicação, resultado final
-- [ ] **Módulo Contract** — número do contrato, vigência, saldo, notas de empenho
+- [x] **Módulo Dispute** — margem, preço de venda, estratégia de lance (esses dados pertencem aqui, não na Cotação)
+- [x] **Módulo PostBid** — homologação, adjudicação, conclusão
+- [x] **Módulo Contract** — número do contrato, vigência, valor, saldo, ciclo próprio
+- [x] **Aprofundamento do agregado Contract** — empenhos (consumo de saldo), faturas, aditivos (valor/prazo)
+- [x] **Dashboard / KPIs** — read model (CQRS-lite) com agregações operacionais, financeiras e de performance
+- [x] **Testes de integração com Testcontainers** — PostgreSQL real, Flyway, cadeia JWT, constraints do banco
+- [ ] Pipeline de CI (GitHub Actions — build + testes)
+- [ ] Pagamentos e medições (deliberadamente fora de escopo — evita transformar o GovProc em ERP financeiro)
 - [ ] Snapshot de nome/documento do fornecedor na Cotação (para precisão histórica imutável)
 - [ ] Índice parcial `WHERE selected = true` no PostgreSQL
-- [ ] Testes de integração (fluxo completo, sem contexto Spring)
 - [ ] Endpoint de promoção de papel (ANALYST → MANAGER → ADMIN)
 
 ---

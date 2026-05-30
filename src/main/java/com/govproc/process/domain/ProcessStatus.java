@@ -10,6 +10,7 @@ public enum ProcessStatus {
     IN_DISPUTE,
     WINNER,
     LOSER,
+    POST_BID,
     CONTRACT_ACTIVE,
     CLOSED
 }

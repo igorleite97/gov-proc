@@ -32,7 +32,8 @@ GovProc models the complete lifecycle of a Brazilian public procurement process 
 - Hard separation between **cost** (Quotation) and **strategy** (Dispute)
 - Dual traceability: `ProcessTimelineEvent` for operational events, `AuditLog` for field-level changes
 - `BigDecimal` with `NUMERIC(19,4)` precision throughout — no `double` for money
-- Modular monolith with 8 bounded-context packages, no unnecessary abstraction layers
+- Modular monolith with 11 bounded-context packages, no unnecessary abstraction layers
+- Each complex phase owns its **own status enum** (`AnalysisDecision`, `DisputeStatus`, `PostBidStatus`, `ContractStatus`) — the core `ProcessStatus` stays lean instead of absorbing every juridical sub-state
 
 ---
 
@@ -41,10 +42,13 @@ GovProc models the complete lifecycle of a Brazilian public procurement process 
 ```
 com.govproc
 ├── auth/           JWT authentication, roles (ADMIN, MANAGER, ANALYST, VIEWER)
-├── process/        Core procurement entity + 11-state machine
+├── process/        Core procurement entity + state machine + dashboard read model
 ├── analysis/       Operational viability analysis (1:1 per process)
 ├── quotation/      Supplier cost records — NO markup, NO margin
 ├── supplier/       Independent supplier registry
+├── dispute/        Commercial strategy — margin, sale price, bid strategy
+├── postbid/        Post-dispute phase — homologation, adjudication
+├── contract/       Contract aggregate — lifecycle + commitments, invoices, addenda
 ├── timeline/       Immutable operational event log
 ├── audit/          Immutable field-level change log
 └── shared/         BaseEntity, ApiResponse, exceptions, global handler
@@ -91,14 +95,20 @@ CAPTURED
        │             │
     WINNER         LOSER
        │
-  [activateContract()]
+   [startPostBid()]
        │
-  CONTRACT_ACTIVE
+     POST_BID   ← post-dispute phase (PostBid: PENDING→HOMOLOGATED→ADJUDICATED→COMPLETED)
+       │
+   [activateContract()]  ← requires PostBid COMPLETED
+       │
+  CONTRACT_ACTIVE   ← contract phase (Contract: ACTIVE→CLOSED/EXPIRED/TERMINATED)
        │
    [close()]
        │
     CLOSED
 ```
+
+> **Note the deliberate restraint:** homologation and adjudication are *not* process states — they live inside the `PostBid` bounded context (`PostBidStatus`). The process only knows it is in `POST_BID`. Same for the contract lifecycle (`ContractStatus`). This keeps `ProcessStatus` at 11 values instead of letting it grow unbounded with every juridical step.
 
 ---
 
@@ -114,7 +124,7 @@ CAPTURED
 | Migrations | Flyway |
 | Validation | Jakarta Bean Validation |
 | Documentation | SpringDoc OpenAPI 3 / Swagger UI |
-| Testing | JUnit 5 + Mockito |
+| Testing | JUnit 5 + Mockito (unit) · Testcontainers (integration) |
 | Build | Maven |
 | Container | Docker + Docker Compose |
 
@@ -145,6 +155,10 @@ All monetary values use `BigDecimal` with `NUMERIC(19,4)` precision. `double` an
 
 `Supplier` has its own lifecycle. `Quotation.supplierId` is stored as a plain `UUID` — no `@ManyToOne`, no cascade. A supplier must not be deleted because a quotation was removed.
 
+### 5. Budget commitment consumes balance — invoice does not
+
+In a public contract these are distinct moments. A **commitment** (_empenho_) reserves budget and **reduces** `remainingBalance` — even before any payment. An **invoice** (_fatura/liquidação_) confirms delivery; it answers *"did the supplier deliver?"*, not *"how much can I still commit?"* — so it does **not** touch the balance. An **addendum** (_aditivo_) changes the contract's capacity (`contractValue` + `remainingBalance` for value types, `endDate` for term types). These invariants live on the `Contract` aggregate root.
+
 ---
 
 ## Module Status
@@ -153,17 +167,21 @@ All monetary values use `BigDecimal` with `NUMERIC(19,4)` precision. `double` an
 |---|---|---|---|
 | `shared/` | ✅ Complete | — | — |
 | `auth/` | ✅ Complete | V1 | 6 |
-| `process/` | ✅ Complete | V2 | — |
+| `process/` | ✅ Complete | V2 | 5 |
 | `timeline/` | ✅ Complete | V3 | — |
 | `analysis/` | ✅ Complete | V4 | 6 |
 | `audit/` | ✅ Complete | V5 | — |
 | `supplier/` | ✅ Complete | V6 | 2 |
 | `quotation/` | ✅ Complete | V7 | 5 |
-| `dispute/` | 🔲 Pending | — | — |
-| `postbid/` | 🔲 Pending | — | — |
-| `contract/` | 🔲 Pending | — | — |
+| `dispute/` | ✅ Complete | V8 | 9 |
+| `postbid/` | ✅ Complete | V9 | 8 |
+| `contract/` | ✅ Complete | V10, V11 | 16 |
 
-**Totals:** 62 classes · 19 tests · 7 Flyway migrations
+> The `process/` tests are the dashboard read-model (CQRS-lite); the core state machine is exercised through every other module's workflow tests.
+
+**Totals:** 118 classes · 60 tests (57 unit + 3 integration) · 11 Flyway migrations
+
+Integration tests (`GovProcIntegrationTest`) run the full Spring Boot context against a real PostgreSQL via **Testcontainers** — proving the 11 Flyway migrations apply, the JPA mapping validates (`ddl-auto=validate`), the JWT chain works end-to-end, and DB constraints (e.g. `uq_process_number_uasg`) surface correctly.
 
 ---
 
@@ -244,6 +262,13 @@ Use the returned token as `Authorization: Bearer <token>` in all subsequent requ
 | `GET` | `/processes/{id}/timeline` | Operational event history |
 | `GET` | `/processes/{id}/audit` | Field-level change log |
 
+### Dashboard (read-only / CQRS-lite)
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/dashboard/summary` | Pipeline counts + active contracts |
+| `GET` | `/dashboard/financial` | Quoted cost, expected profit, contract value, remaining balance |
+| `GET` | `/dashboard/performance` | Win rate, loss rate, average expected profit |
+
 ### Analysis
 | Method | Path | Description |
 |---|---|---|
@@ -269,6 +294,43 @@ Use the returned token as `Authorization: Bearer <token>` in all subsequent requ
 | `GET` | `/suppliers/{id}` | Get supplier by ID |
 | `DELETE` | `/suppliers/{id}` | Deactivate supplier (logical delete) |
 
+### Dispute
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/processes/{id}/dispute/start` | Start dispute → `IN_DISPUTE` (snapshots quoted cost) |
+| `PUT` | `/processes/{id}/dispute` | Revise commercial strategy (field-level audit) |
+| `POST` | `/processes/{id}/dispute/winner` | Mark as winner → `WINNER` |
+| `POST` | `/processes/{id}/dispute/loser` | Mark as loser → `LOSER` |
+| `GET` | `/processes/{id}/dispute` | Get dispute record |
+
+### PostBid
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/processes/{id}/post-bid/start` | Start post-dispute phase → `POST_BID` |
+| `POST` | `/processes/{id}/post-bid/homologate` | Homologate → `HOMOLOGATED` |
+| `POST` | `/processes/{id}/post-bid/adjudicate` | Adjudicate → `ADJUDICATED` |
+| `POST` | `/processes/{id}/post-bid/complete` | Complete → `COMPLETED` |
+| `GET` | `/processes/{id}/post-bid` | Get post-bid record |
+
+### Contract
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/processes/{id}/contract/activate` | Activate contract → `CONTRACT_ACTIVE` (requires PostBid COMPLETED) |
+| `POST` | `/processes/{id}/contract/close` | Close contract & process → `CLOSED` |
+| `POST` | `/processes/{id}/contract/terminate` | Terminate (early) → contract `TERMINATED`, process `CLOSED` |
+| `POST` | `/processes/{id}/contract/expire` | Expire → contract `EXPIRED`, process `CLOSED` |
+| `GET` | `/processes/{id}/contract` | Get contract record |
+
+### Contract Execution (aggregate members)
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/processes/{id}/contract/commitments` | Register commitment (_empenho_) — **reduces balance** |
+| `GET` | `/processes/{id}/contract/commitments` | List commitments |
+| `POST` | `/processes/{id}/contract/invoices` | Register invoice (_fatura_) — does **not** touch balance |
+| `GET` | `/processes/{id}/contract/invoices` | List invoices |
+| `POST` | `/processes/{id}/contract/addenda` | Apply addendum (_aditivo_) — value or term change |
+| `GET` | `/processes/{id}/contract/addenda` | List addenda |
+
 ---
 
 ## Technical Decisions
@@ -288,16 +350,26 @@ Timeline and audit calls are explicit in every service method. The tradeoff is v
 ### Atomic quotation selection
 `selectQuotation()` calls `clearSelectedByProcess(processId)` via `@Modifying @Query` before calling `quotation.select()`. This ensures exactly one `selected = true` per process with no inconsistency window.
 
+### Sub-statuses stay out of `ProcessStatus`
+Homologation, adjudication and the contract lifecycle are *not* process states. They are encapsulated in their own enums (`PostBidStatus`, `ContractStatus`) inside their bounded contexts. The core machine only knows `POST_BID` and `CONTRACT_ACTIVE`. This is the same reasoning that keeps `DisputeStatus` (OPEN/CONCLUDED) out of the process — and it prevents `ProcessStatus` from growing unbounded.
+
+### Contract activation guard lives in the service
+`activateContract()` (the domain method) only validates `POST_BID → CONTRACT_ACTIVE`. The rule *"only when the post-dispute phase is COMPLETED"* lives in `ContractService`, because the process does not — and should not — know about `PostBid`. Cross-context invariants belong to the application layer, not the entity.
+
 ---
 
 ## Roadmap
 
-- [ ] **Dispute module** — markup, margin, bid strategy (these belong here, not in Quotation)
-- [ ] **PostBid module** — homologation, adjudication, final result
-- [ ] **Contract module** — contract number, validity, balance, budget notes
+- [x] **Dispute module** — margin, sale price, bid strategy (these belong here, not in Quotation)
+- [x] **PostBid module** — homologation, adjudication, completion
+- [x] **Contract module** — contract number, validity, value, balance, own lifecycle
+- [x] **Contract aggregate deepening** — commitments (balance consumption), invoices, addenda (value/term changes)
+- [x] **Dashboard / KPIs** — read model (CQRS-lite) with summary, financial and performance aggregations
+- [x] **Integration tests with Testcontainers** — real PostgreSQL, Flyway, JWT chain, DB constraints
+- [ ] CI pipeline (GitHub Actions — build + tests)
+- [ ] Payments & measurements (deliberately out of scope — avoids turning GovProc into a financial ERP)
 - [ ] Supplier name/document snapshot on Quotation (for immutable historical accuracy)
 - [ ] Partial unique index `WHERE selected = true` at the database level
-- [ ] Integration tests (full workflow, no Spring context)
 - [ ] Role promotion endpoint (ANALYST → MANAGER → ADMIN)
 
 ---
